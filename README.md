@@ -4,7 +4,7 @@
 
 **DLT-daemon** 不仅仅是一个“写日志”的工具，它是车载 Linux 系统中不可或缺的通信中枢。
 
-![1773564596835](DLT日志系统移植与开发.assets/1773564596835.png)
+![1773564596835](images/1773564596835.png)
 
 - **DLT User** 
   - 本质上是一个服务于其各自（与 DLT 无关）目的并生成 DLT 日志消息的应用程序。它利用 DLT 库来制作和传输这些消息。
@@ -182,3 +182,159 @@ ls -l /usr/local/include/dlt/dlt_user.h
   # 通过 -I 参数显式告诉编译器头文件所在的具体文件夹
   gcc hello_dlt.c -o hello_dlt -I /usr/local/include/dlt -ldlt
   ```
+
+### **运行环境准备**
+
+- #### **终端 A**
+
+  - 模拟dlt-daemon守护进程，传递消息
+
+  - ```bash
+    sudo dlt-daemon 
+    ```
+
+  - 运行结果如下：包括从启动到建立连接到传送消息
+
+  - ![1773581379494](images/1773581379494.png)
+
+  - 
+
+  - ![1773581408986](images/1773581408986.png)
+
+  - 按**时间顺序**，为你逐条拆解上图这些“专业术语”的含义：
+
+    ------
+
+  - **第一阶段：守护进程启动 (Initialization)**
+
+    - **Starting DLT Daemon; DLT Package Version: 3.0.1 STABLE...** 这是 Daemon 的开机自检，确认了你刚编译的版本是 3.0.1。下面的 `-SYSTEMD -SHM` 说明你在编译时关闭了系统集成和共享内存功能（这符合我们之前的简化编译策略）。
+    - **FIFO size: 65536** Daemon 开辟了 64KB 的命名管道缓冲区。当你的 App 发送日志太快时，数据会先存在这里。
+    - **Listening on ip 0.0.0.0 and port: 3490** **关键点：** Daemon 已经打开了 TCP 网络监听。这意味着不仅是你本机，同一局域网下的其他电脑（比如装了 DLT Viewer 的 Windows）也可以通过 3490 端口看你的日志。
+    - **Ringbuffer configuration: 500000/10000000/500000** 这是环形缓冲区设置。如果没有任何接收端连接，Daemon 会在内存中循环存储日志，防止丢失。
+
+    ------
+
+  - **第二阶段：状态切换 (Connection State)**
+
+    - **Switched to buffer state for socket connections.** 启动初期，因为还没有 `dlt-receive` 连接上来，Daemon 处于“缓存模式”：日志只存进内存，不向外发。
+    - **Activate connection type: 2** 检测到有外部客户端（即你的终端 B：`dlt-receive`）通过 Socket 连进来了。
+    - **Switched to send direct state.** **重要信号：** 因为有了接收端，Daemon 切换到了“直发模式”。现在收到的任何日志都会立即通过网络推送到终端 B。
+
+    ------
+
+  - **第三阶段：你的程序接入 (Application Handshake)**
+
+    这是第二张截图最后一行最硬核的内容，也是证明你程序跑通的证据：
+
+    - **Send log-level to context: HELO:TEST [-1 -> 4]** 这是你的 `hello_dlt` 运行时产生的握手日志：
+      - **HELO:TEST**：对应你在代码里写的 AppID (`HELO`) 和 ContextID (`TEST`)。
+      - **[-1 -> 4]**：这代表日志级别的同步。`-1` 是初始未知状态，`4` 代表 **DLT_LOG_INFO**。
+      - **含义**：Daemon 告诉你的程序：“嘿，我知道你是 HELO 模块的 TEST 上下文了，现在请把 INFO 级别（4）及以上的日志都发给我。”
+
+  - **总结**
+
+    - DLT 客户端和 Daemon 是如何交互的 
+      - 首先，Daemon 会初始化 FIFO 管道和网络 Socket。
+      - 当客户端（App）启动时，会通过 IPC 注册自己的 AppID。
+      - 我在日志中观察到 **Send log-level to context** 的打印，这标志着 App 和 Daemon 成功建立了同步。
+      - 此时 Daemon 会下发当前全局定义的日志级别（如 Level 4），App 随后根据这个级别开始按需推送日志流 
+
+- #### 终端 B
+
+  - 模拟client，接收数据
+
+  -  
+
+    ```bash
+    dlt-receive -a localhost
+    ```
+
+  - 运行结果如下：包括从启动到建立连接到接收消息
+
+  - ![1773581362631](images/1773581362631.png)
+
+  - **这是 `dlt-receive` 终端捕获到的真实协议数据，信息量非常大**
+
+    我们按照 DLT 的 **标准协议格式** 逐项解释这些打印的含义：
+
+    ------
+
+  - **1. DLT 日志的标准格式拆解**
+
+    以你程序的最后一条日志为例：
+
+    `2026/03/15 09:10:42.971009  872678245 004 ECU1 HELO TEST log info V 2 [Success! Count: 4]`
+
+    | **组成部分**     | **示例内容**                 | **含义**                                                  |
+    | ---------------- | ---------------------------- | --------------------------------------------------------- |
+    | **时间戳**       | `2026/03/15 09:10:42.971009` | 接收端捕获这条消息的精确时间。                            |
+    | **消息计数**     | `872678245`                  | 这是消息的序列号，用于检测日志是否丢包。                  |
+    | **Index**        | `004`                        | 本次会话中该 Context 的消息序号（从 0 开始计）。          |
+    | **ECU ID**       | `ECU1`                       | 节点标识符（默认是 ECU1）。                               |
+    | **AppID**        | **HELO**                     | 对应你代码里的 `DLT_REGISTER_APP("HELO", ...)`。          |
+    | **ContextID**    | **TEST**                     | 对应你代码里的 `DLT_REGISTER_CONTEXT(..., "TEST", ...)`。 |
+    | **信息类型**     | `log info`                   | 消息级别为 INFO。如果是报错会显示 `log error`。           |
+    | **Payload 类型** | `V`                          | **Verbose 模式**，表示消息包含可读的参数描述。            |
+    | **参数个数**     | `2`                          | 你的日志由 2 个部分组成：字符串 + 整数。                  |
+    | **日志内容**     | `[Success! Count: 4]`        | 最终拼装出来的业务日志数据。                              |
+
+    ------
+
+  - **2. 关键系统消息解释**
+
+    除了你自己的日志，截图里还有几条 DLT 系统产生的“控制消息”，这能体现你对中间件底层逻辑的理解：
+
+    - **DLTD INTM log info ... [Daemon launched...]**
+      - 这是 DLT Daemon 自己的内部日志（INTM = Internal Message）。它在告诉所有接收端：“我刚启动，开始输出追踪数据了。”
+    - **DLTD INTM log info ... [ApplicationID 'HELO' registered for PID 16733...]**
+      - **重要！** 这记录了你的 `hello_dlt` 程序（进程 ID 为 16733）向 Daemon 报到的瞬间。
+    - **DA1- DC1- control response N 1 ...**
+      - 这是 **控制指令的响应**。
+      - `DA1` 代表 DLT Agent，`DC1` 代表 DLT Controller。
+      - 当 `dlt-receive` 连上时，它会自动查询当前有哪些 App 在线，这些奇怪的十六进制码就是 Daemon 返回的 App 列表数据。
+
+  - **总结**
+
+    - 在这张 `dlt-receive` 的监控截图中，我们可以看到整个 DLT 链路的生命周期。
+    - 首先是 **DLT Daemon** 的初始化，随后是 PID 为 16733 的应用通过 **HELO AppID** 完成了注册。
+    - 在业务逻辑部分，程序以 **Verbose 模式** 推送了 5 条日志。通过观察 **Timestamp** 和 **Index (000-004)**，可以确认日志是按照 1 秒为间隔稳定推送的，没有出现丢包（序列号连续）。
+    - 此外，最后一行显示的 **control response** 是 DLT 协议内部的控制流，用于同步 ECU 的状态信息，这证明了 Agent 和 Receiver 之间的双向通信是正常的
+
+- #### 终端C
+
+  - 模拟App发送消息，运行先前编译好的hello_dlt
+
+  - ```bash
+    sudo ./hello_dlt
+    ```
+
+  - 
+
+  - ![1773581343388](images/1773581343388.png)
+
+  - **DLT 客户端程序（hello_dlt）** 的控制台输出。
+
+    在车载开发中，这种本地终端的打印通常被称为 **Console Log** 或 **Standard Output (stdout)**。它与你刚才在 `dlt-receive` 看到的日志有着本质的区别。下面我为你详细拆解：
+
+    ------
+
+  - **1. 打印内容的含义**
+
+    这些 `Sending DLT message X...` 是通过你代码中的 `printf` 语句产生的：
+
+    - **本地确认**：它存在的唯一目的是告诉你（开发者）：“我的程序没死，循环正在跑，代码逻辑已经执行到了发送日志的那一步。”
+    - **非 DLT 数据**：**注意**，这些文字并不会被发送到 DLT Daemon，也不会出现在 `dlt-receive` 窗口中。它们只存在于你当前的这个黑色终端里。
+
+    ------
+
+  - **2. 车载开发的“最佳实践”：双路并行**
+
+    通过这张截图，你实际上演示了一个非常专业的调试场景：
+
+    1. **控制台打印 (printf)**：用于程序运行状态的实时反馈，简单直接，但不带协议格式，通常在量产发布版中会被禁用。
+    2. **DLT 日志 (DLT_LOG)**：在后台默默将结构化数据发给 Daemon。它包含时间戳、AppID、模块信息，是可以被长期存储和离线分析的“黑匣子数据”。
+
+  - **总结**
+
+    - 在开发 DLT 客户端时，我通过 **Console stdout 与 DLT 日志双重校验** 的方式验证了消息发送的实时性。
+    - 本地控制台用于实时观察程序循环状态，而 DLT 协议流则通过 DLT-Daemon 转发至接收端，确保了业务逻辑与系统日志监控的同步解耦 
